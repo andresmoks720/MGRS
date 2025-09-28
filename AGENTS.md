@@ -32,10 +32,11 @@ This agent assists with:
 - **STT**: simulated via `input()` (replace with Whisper and sounddevice if needed)
 
 ## 4. Testing & Quality
-- **Unit tests**: use `pytest` (place tests under `tests/`)  
+- **Unit tests**: use `pytest` (place tests under `tests/`)
   ```bash
   pytest --maxfail=1 --disable-warnings -q
   ```
+  The suite includes OCR parsing edge cases and SALUTE conversation flows.
 - **Linters/Formatters**:  
   ```bash
   flake8 .
