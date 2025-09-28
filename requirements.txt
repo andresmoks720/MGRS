@@ -3,3 +3,4 @@ requests
 pytesseract
 Pillow
 mgrs
+python-telegram-bot>=13,<14
