@@ -8,6 +8,7 @@ import logging
 import shutil
 import sys
 from datetime import datetime
+from typing import Any
 
 import requests
 from openai import OpenAI
@@ -25,13 +26,29 @@ def record_and_transcribe(sec: int = 5) -> str:  # noqa: ARG001 - placeholder sh
     return input("[STT] (type response) ")
 
 
+class GmtTimeError(RuntimeError):
+    """Raised when the GMT API returns malformed data."""
+
+
 def fetch_gmt_time() -> str:
     """Return the current GMT timestamp using worldtimeapi.org."""
 
     resp = requests.get("https://worldtimeapi.org/api/timezone/Etc/GMT", timeout=10)
     resp.raise_for_status()
-    payload = resp.json()
-    dt = datetime.fromisoformat(payload["datetime"])
+    try:
+        payload: dict[str, Any] = resp.json()
+    except ValueError as exc:  # json() failed to decode response
+        raise GmtTimeError("Invalid JSON payload from GMT API") from exc
+
+    dt_raw = payload.get("datetime")
+    if not isinstance(dt_raw, str):
+        raise GmtTimeError("GMT API response missing datetime string")
+
+    try:
+        dt = datetime.fromisoformat(dt_raw)
+    except ValueError as exc:
+        raise GmtTimeError("GMT API datetime string was malformed") from exc
+
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
 
 
@@ -51,7 +68,9 @@ def salute_dialogue(conversation: SaluteConversation) -> None:
 
 def warn_if_missing_tesseract(logger: logging.Logger) -> None:
     if shutil.which("tesseract") is None:
-        logger.warning("Tesseract not in PATH – OCR fallback will fail")
+        logger.warning(
+            "Tesseract not in PATH – using GPT vision fallback (may be slower)"
+        )
 
 
 def build_client(config: AppConfig) -> OpenAI:
@@ -91,7 +110,7 @@ def run_cli(args, config: AppConfig) -> None:
     if args.show_gmt:
         try:
             print(f"[GMT] {fetch_gmt_time()}")
-        except requests.RequestException as exc:
+        except (requests.RequestException, GmtTimeError) as exc:
             logger.warning("GMT fetch failed: %s", exc)
 
     if not args.no_salute:

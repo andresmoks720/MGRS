@@ -13,6 +13,7 @@ from mimetypes import guess_type
 from typing import Callable, Iterable, Optional, Tuple
 
 import pytesseract
+from pytesseract.pytesseract import TesseractNotFoundError
 from PIL import Image, ImageEnhance
 from mgrs import MGRS
 
@@ -126,19 +127,35 @@ def tesseract_ocr(
         return ""
 
     best_txt = ""
-    for angle in angles:
-        txt = pytesseract.image_to_string(
-            preprocess(base.rotate(angle, expand=True)),
-            config=f"--psm {psm} -c tessedit_char_whitelist={whitelist}",
-        ).strip()
+    try:
+        for angle in angles:
+            try:
+                txt = pytesseract.image_to_string(
+                    preprocess(base.rotate(angle, expand=True)),
+                    config=f"--psm {psm} -c tessedit_char_whitelist={whitelist}",
+                ).strip()
+            except TesseractNotFoundError:
+                message = "Tesseract binary not found; skipping to GPT fallback."
+                if logger:
+                    logger.warning(message)
+                else:
+                    print(f"⚠️  {message}", file=sys.stderr)
+                return ""
+            if logger:
+                logger.debug("[Tesseract %d°] %s", angle, txt or "[no text]")
+            else:
+                print(f"\n[Tesseract {angle}°]\n{txt or '[no text]'}")
+            if txt:
+                best_txt = txt
+            if parse_coords(txt, logger=logger, geo=geo):
+                return txt
+    except TesseractNotFoundError:
+        message = "Tesseract binary not found; skipping to GPT fallback."
         if logger:
-            logger.debug("[Tesseract %d°] %s", angle, txt or "[no text]")
+            logger.warning(message)
         else:
-            print(f"\n[Tesseract {angle}°]\n{txt or '[no text]'}")
-        if txt:
-            best_txt = txt
-        if parse_coords(txt, logger=logger, geo=geo):
-            return txt
+            print(f"⚠️  {message}", file=sys.stderr)
+        return ""
     return best_txt
 
 
@@ -193,6 +210,7 @@ def parse_coords(
         lon = float(match_lon.group(1)) * (1 if match_lon.group(2) == "E" else -1)
     else:
         parts = [_strip_dir_suffix(p) for p in re.split(r"[,\s]+", t) if p]
+        parts = [p for p in parts if p]
         if len(parts) < 2:
             return None
         try:
