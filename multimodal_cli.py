@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import shutil
 import sys
 from datetime import datetime
 from typing import Any
@@ -15,7 +14,7 @@ from openai import OpenAI
 
 from config import AppConfig, load_config
 from logging_utils import configure_logging, get_logger
-from ocr_shared import run_ocr
+from ocr_shared import run_ocr, warn_if_missing_tesseract
 from salute import SaluteConversation
 
 def speak(text: str) -> None:
@@ -66,22 +65,23 @@ def salute_dialogue(conversation: SaluteConversation) -> None:
             break
 
 
-def warn_if_missing_tesseract(logger: logging.Logger) -> None:
-    if shutil.which("tesseract") is None:
-        logger.warning(
-            "Tesseract not in PATH – using GPT vision fallback (may be slower)"
-        )
-
-
 def build_client(config: AppConfig) -> OpenAI:
     return OpenAI(api_key=config.openai_api_key)
 
 
 def run_cli(args, config: AppConfig) -> None:
     logger = get_logger("multimodal_cli")
-    warn_if_missing_tesseract(logger)
+    missing_tesseract = warn_if_missing_tesseract(logger)
 
-    client = build_client(config)
+    client: OpenAI | None = None
+    if config.openai_api_key:
+        client = build_client(config)
+    else:
+        if missing_tesseract:
+            sys.exit(
+                "❌  Tesseract puudub ja GPT varuplaan on keelatud (OpenAI võti puudub)."
+            )
+        logger.info("GPT vision fallback disabled: OpenAI API key not configured.")
 
     def report_raw(engine: str, text: str) -> None:
         print(f"\n=== {engine} ===\n", text or "[tühi]")
@@ -139,7 +139,7 @@ def main() -> None:
     configure_logging()
 
     try:
-        config = load_config(require_openai=True)
+        config = load_config(require_openai=False)
     except RuntimeError as exc:
         sys.exit(f"❌  {exc}")
 

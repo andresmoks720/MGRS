@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 from typing import Optional
 
@@ -18,10 +17,11 @@ from telegram.ext import (
     MessageHandler,
     Updater,
 )
+from telegram.error import TelegramError
 
 from config import AppConfig, load_config
 from logging_utils import configure_logging, get_logger
-from ocr_shared import run_ocr
+from ocr_shared import run_ocr, warn_if_missing_tesseract
 from salute import SaluteConversation
 
 SALUTE = 1
@@ -69,20 +69,43 @@ def salute_handler(update: Update, context: CallbackContext) -> int:
 
 
 def handle_photo(update: Update, context: CallbackContext) -> int:
-    assert CLIENT is not None
-    assert CONFIG is not None
+    config = CONFIG
+    client = CLIENT
 
-    photo = update.message.photo[-1]
-    tg_file = context.bot.get_file(photo.file_id)
+    if client is None or config is None:
+        LOGGER.error("Bot configuration incomplete; refusing to process photo")
+        update.message.reply_text("Teenusel puudub konfiguratsioon. Palun proovi hiljem uuesti.")
+        return ConversationHandler.END
+
+    try:
+        photo = update.message.photo[-1]
+    except (AttributeError, IndexError):  # pragma: no cover - defensive guard
+        LOGGER.warning("Received photo update without image payload")
+        update.message.reply_text("Pildist ei saadud aru. Palun proovi uuesti.")
+        return ConversationHandler.END
+
+    try:
+        tg_file = context.bot.get_file(photo.file_id)
+    except TelegramError as exc:
+        LOGGER.error("Failed to fetch Telegram file: %s", exc)
+        update.message.reply_text("Pildi allalaadimine ebaõnnestus. Palun proovi uuesti.")
+        return ConversationHandler.END
 
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     tmp.close()
     path = tmp.name
 
+    result = None
     try:
-        tg_file.download(path)
         try:
-            result = run_ocr(path, CLIENT, logger=LOGGER, geo=CONFIG.geo)
+            tg_file.download(path)
+        except TelegramError as exc:
+            LOGGER.error("Telegram download failed: %s", exc)
+            update.message.reply_text("Pildi allalaadimine ebaõnnestus. Palun proovi uuesti.")
+            return ConversationHandler.END
+
+        try:
+            result = run_ocr(path, client, logger=LOGGER, geo=config.geo)
         except Exception as exc:  # pragma: no cover - network failure path
             LOGGER.error("OCR pipeline failed: %s", exc)
             result = None
@@ -98,7 +121,7 @@ def handle_photo(update: Update, context: CallbackContext) -> int:
 
     update.message.reply_text(f"📍 Koordinaadid: {result.decimal}\n🗺 MGRS: {result.mgrs}")
     context.user_data["salute_conv"] = SaluteConversation(
-        fields=CONFIG.salute_fields,
+        fields=config.salute_fields,
         location=result.mgrs,
     )
     return ask_salute(update, context)
@@ -121,8 +144,7 @@ def main() -> None:
     CONFIG = config
     CLIENT = OpenAI(api_key=config.openai_api_key)
 
-    if shutil.which("tesseract") is None:
-        LOGGER.warning("Tesseract not in PATH – OCR fallback will fail")
+    warn_if_missing_tesseract(LOGGER)
 
     updater = Updater(token=config.telegram_api_token, use_context=True)
     dispatcher = updater.dispatcher
