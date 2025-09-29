@@ -37,7 +37,7 @@ def test_warn_if_missing_tesseract_mentions_fallback(
 ) -> None:
     """Warn about missing Tesseract but reassure users about the GPT fallback."""
 
-    monkeypatch.setattr(multimodal_cli.shutil, "which", lambda _: None)
+    monkeypatch.setattr("ocr_shared.shutil.which", lambda _: None)
 
     logger = logging.getLogger("multimodal_cli.test")
     with caplog.at_level(logging.WARNING):
@@ -83,9 +83,50 @@ def test_run_cli_logs_warning_when_gmt_payload_bad(
         raise multimodal_cli.GmtTimeError("bad payload")
 
     monkeypatch.setattr(multimodal_cli, "fetch_gmt_time", bad_fetch)
-    monkeypatch.setattr(multimodal_cli.shutil, "which", lambda *_: "tesseract")
+    monkeypatch.setattr(multimodal_cli, "warn_if_missing_tesseract", lambda *_: False)
 
     with caplog.at_level(logging.WARNING, logger="multimodal_cli"):
         multimodal_cli.run_cli(args, config)
 
     assert any("GMT fetch failed" in record.getMessage() for record in caplog.records)
+
+
+def test_run_cli_allows_tesseract_only_mode(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """run_cli should skip GPT setup when no API key is configured."""
+
+    args = SimpleNamespace(image="dummy.png", show_gmt=False, no_salute=True)
+    config = AppConfig(openai_api_key="", telegram_api_token=None)
+
+    ocr_result = OcrResult(lat=59.0, lon=24.0, engine="Tesseract", raw_text="")
+
+    def fail_build_client(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("build_client should not be called without API key")
+
+    def fake_run_ocr(path, client, **kwargs):  # type: ignore[no-untyped-def]
+        assert client is None
+        return ocr_result
+
+    monkeypatch.setattr(multimodal_cli, "build_client", fail_build_client)
+    monkeypatch.setattr(multimodal_cli, "run_ocr", fake_run_ocr)
+    monkeypatch.setattr(multimodal_cli, "warn_if_missing_tesseract", lambda *_: False)
+
+    with caplog.at_level(logging.INFO, logger="multimodal_cli"):
+        multimodal_cli.run_cli(args, config)
+
+    assert "fallback disabled" in caplog.text
+
+
+def test_run_cli_exits_when_no_tesseract_and_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tesseract-only mode should exit when Tesseract is missing."""
+
+    args = SimpleNamespace(image="dummy.png", show_gmt=False, no_salute=True)
+    config = AppConfig(openai_api_key="", telegram_api_token=None)
+
+    monkeypatch.setattr(multimodal_cli, "warn_if_missing_tesseract", lambda *_: True)
+
+    with pytest.raises(SystemExit) as excinfo:
+        multimodal_cli.run_cli(args, config)
+
+    assert "OpenAI" in str(excinfo.value)

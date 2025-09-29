@@ -6,11 +6,12 @@ import logging
 import math
 import random
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass
 from mimetypes import guess_type
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import pytesseract
 from pytesseract.pytesseract import TesseractNotFoundError
@@ -26,6 +27,20 @@ LON_MAX = DEFAULT_GEO_BOUNDS.lon_max
 REF_LAT = DEFAULT_GEO_BOUNDS.ref_lat
 REF_LON = DEFAULT_GEO_BOUNDS.ref_lon
 RADIUS_KM = DEFAULT_GEO_BOUNDS.radius_km
+
+MISSING_TESSERACT_WARNING = "Tesseract not in PATH – using GPT vision fallback (may be slower)"
+
+
+def warn_if_missing_tesseract(logger: Optional[logging.Logger] = None) -> bool:
+    """Log a warning when Tesseract is missing and return True if absent."""
+
+    missing = shutil.which("tesseract") is None
+    if missing:
+        if logger:
+            logger.warning(MISSING_TESSERACT_WARNING)
+        else:
+            print(f"⚠️  {MISSING_TESSERACT_WARNING}", file=sys.stderr)
+    return missing
 
 _DEFAULT_PROMPT = (
     "Leia drooni ekraanil kuvatud GPS-koordinaadid ja vasta ainult kümnendkraadides, "
@@ -118,45 +133,36 @@ def tesseract_ocr(
     """Run Tesseract OCR against the provided image path."""
 
     try:
-        base = Image.open(path)
+        with Image.open(path) as base:
+            best_txt = ""
+            for angle in angles:
+                try:
+                    txt = pytesseract.image_to_string(
+                        preprocess(base.rotate(angle, expand=True)),
+                        config=f"--psm {psm} -c tessedit_char_whitelist={whitelist}",
+                    ).strip()
+                except TesseractNotFoundError:
+                    message = "Tesseract binary not found; skipping to GPT fallback."
+                    if logger:
+                        logger.warning(message)
+                    else:
+                        print(f"⚠️  {message}", file=sys.stderr)
+                    return ""
+                if logger:
+                    logger.debug("[Tesseract %d°] %s", angle, txt or "[no text]")
+                else:
+                    print(f"\n[Tesseract {angle}°]\n{txt or '[no text]'}")
+                if txt:
+                    best_txt = txt
+                if parse_coords(txt, logger=logger, geo=geo):
+                    return txt
+            return best_txt
     except Exception as exc:  # pragma: no cover - file failure path
         if logger:
             logger.error("Cannot open %s: %s", path, exc)
         else:
             print("❌  Cannot open image:", exc, file=sys.stderr)
         return ""
-
-    best_txt = ""
-    try:
-        for angle in angles:
-            try:
-                txt = pytesseract.image_to_string(
-                    preprocess(base.rotate(angle, expand=True)),
-                    config=f"--psm {psm} -c tessedit_char_whitelist={whitelist}",
-                ).strip()
-            except TesseractNotFoundError:
-                message = "Tesseract binary not found; skipping to GPT fallback."
-                if logger:
-                    logger.warning(message)
-                else:
-                    print(f"⚠️  {message}", file=sys.stderr)
-                return ""
-            if logger:
-                logger.debug("[Tesseract %d°] %s", angle, txt or "[no text]")
-            else:
-                print(f"\n[Tesseract {angle}°]\n{txt or '[no text]'}")
-            if txt:
-                best_txt = txt
-            if parse_coords(txt, logger=logger, geo=geo):
-                return txt
-    except TesseractNotFoundError:
-        message = "Tesseract binary not found; skipping to GPT fallback."
-        if logger:
-            logger.warning(message)
-        else:
-            print(f"⚠️  {message}", file=sys.stderr)
-        return ""
-    return best_txt
 
 
 def gpt_vision_ocr(
@@ -184,7 +190,45 @@ def gpt_vision_ocr(
         timeout=60,
         logger=logger,
     )
-    return resp.choices[0].message.content.strip()
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        message = "GPT vision response missing completion choices; returning empty string."
+        if logger:
+            logger.warning(message)
+        else:
+            print(f"⚠️  {message}", file=sys.stderr)
+        return ""
+
+    first_choice = choices[0]
+    message_obj = getattr(first_choice, "message", None)
+    if message_obj is None and isinstance(first_choice, dict):
+        message_obj = first_choice.get("message")
+
+    content = None
+    if message_obj is not None:
+        content = getattr(message_obj, "content", None)
+        if content is None and isinstance(message_obj, dict):
+            content = message_obj.get("content")
+
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+            elif isinstance(part, str):
+                texts.append(part)
+        content = "\n".join(segment.strip() for segment in texts if segment.strip())
+
+    if not isinstance(content, str) or not content.strip():
+        message = "GPT vision response missing text content; returning empty string."
+        if logger:
+            logger.warning(message)
+        else:
+            print(f"⚠️  {message}", file=sys.stderr)
+        return ""
+
+    return content.strip()
 
 
 def _strip_dir_suffix(value: str) -> str:
@@ -202,6 +246,8 @@ def parse_coords(
     if not txt:
         return None
     t = txt.upper().replace("°", " ")
+    # Normalize decimal commas (e.g., "59,437") to dots before parsing.
+    t = re.sub(r"(?<=\d),(?=\d)", ".", t)
 
     match_lat = re.search(r"(-?\d+\.\d+)\s*([NS])", t)
     match_lon = re.search(r"(-?\d+\.\d+)\s*([EW])", t)
@@ -255,7 +301,7 @@ def format_decimal(lat: float, lon: float) -> str:
 
 def run_ocr(
     path: str,
-    client,
+    client: Optional[Any] = None,
     *,
     logger: Optional[logging.Logger] = None,
     on_raw: Optional[Callable[[str, str], None]] = None,
@@ -270,6 +316,14 @@ def run_ocr(
     if coords:
         lat, lon = coords
         return OcrResult(lat=lat, lon=lon, engine="Tesseract", raw_text=raw)
+
+    if client is None:
+        message = "GPT fallback unavailable because OpenAI client is not configured."
+        if logger:
+            logger.warning(message)
+        else:
+            print(f"⚠️  {message}", file=sys.stderr)
+        return None
 
     raw = gpt_vision_ocr(path, client, logger=logger)
     if on_raw:
@@ -290,6 +344,8 @@ __all__ = [
     "REF_LAT",
     "REF_LON",
     "RADIUS_KM",
+    "MISSING_TESSERACT_WARNING",
+    "warn_if_missing_tesseract",
     "OcrResult",
     "retry",
     "to_data_url",
